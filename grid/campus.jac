@@ -38,7 +38,9 @@ def tie(a: GridNode, b: GridNode, label: str) {
 
 """Construct the NMCP campus graph and attach it to root."""
 def build_campus -> Run {
-    run = root ++> Run(site="Naval Medical Center Portsmouth", memory_enabled=True);
+    # `++>` evaluates to a *list* of the nodes it connected, so index it. Without
+    # the [0] every caller gets a list and LoadSite dies on `run.memory_enabled`.
+    run = (root ++> Run(site="Naval Medical Center Portsmouth", memory_enabled=True))[0];
 
     # ---------------------------------------------------------- utility feeds
     # Elizabeth is the river-side feed at 2.1 m elevation - the flood-exposed
