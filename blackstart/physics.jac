@@ -1,92 +1,98 @@
 """BLACKSTART - the clock. NO AI IN THIS FILE, BY DESIGN.
 
-One tick is 15 simulated minutes. Every tick, in this fixed order:
+One tick is 15 simulated minutes and does exactly this, in this order:
 
-    1. advance the simulation clock
-    2. refresh solar output from the real hourly curve
-    3. run the brain  (islanding -> endurance -> shedding)
-    4. dispatch energy for the interval and move the physical state
+    1. advance the clock and move the physical state (battery, fuel)
+    2. island and measure -- WITHOUT acting
+    3. write a Snapshot: this is the evidence
+    4. record whatever caused this tick (a cut, a RED strike)
+    5. let BLUE decide, and hang every decision off that Snapshot
+    6. re-measure so the number on screen is current
 
-Dispatch priority inside an island is always the same and is never a
-judgement call: solar first (free), then the genset up to its power rating
-(it is the only source with a large energy reserve behind it), then the
-battery for the remainder. Surplus solar charges the battery. This is the
-same ordering triage.project_endurance uses -- they have to agree or the
-survival clock is a lie. See the note in triage.jac for why the intuitive
-"battery before diesel" ordering strands the whole fuel tank.
+Steps 2-5 are in that order because the audit chain has to record the state
+that CAUSED a decision, not the state that resulted from it. Get this backwards
+and "why did the cafeteria go dark" answers with the wrong numbers.
 
-A genset that runs out of fuel simply stops being an energised source --
-islanding notices on the next cycle, so there is no special case anywhere
-for "the generator died".
+Dispatch inside an island is fixed and is never a judgement call: the generator
+carries base load up to its rating, the battery covers what the rating cannot.
+The tempting order -- battery first, fuel is precious -- strands the whole fuel
+tank behind the generator's kW rating.
 """
 
-import from grid { GridNode, GridTie, Solar, Battery, Genset, Load, Base }
-import from triage { RunTriage, measure_island, assets_of }
+import from grid {
+    GridNode, UtilityTie, Generator, Battery, Facility, Campus,
+    Snapshot, Event, Feeds, PartOf
+}
+import from triage {
+    RunTriage, IslandState, ShedRecord, assets_of, refresh_state, blue_shed,
+    measure_island, resupply_open
+}
+import from ops { record_snapshot, record_event, record_decision, asset_label }
 
-glob DT_H: float = 0.25;               # 15 simulated minutes per tick
+glob DT_H: float = 0.25;            # 15 simulated minutes
 
 
-"""Deterministic ordering for dispatch -- alphabetical, never dict order."""
-def by_name(n: GridNode) -> str {
-    if isinstance(n, Battery) {
-        return (n as Battery).name;
-    }
-    if isinstance(n, Genset) {
-        return (n as Genset).name;
-    }
-    return "";
+"""Live generators in one island, in a stable order."""
+def generators_in(campus: Campus, island_id: int) -> list[Generator] {
+    return sorted(
+        [
+            a as Generator for a in assets_of(campus)
+            if isinstance(a, Generator) and a.island_id == island_id and a.alive
+        ],
+        key=lambda g: Generator : g.name
+    );
 }
 
 
 """Live batteries in one island, in a stable order."""
-def batteries_in(base: Base, island_id: int) -> list[Battery] {
+def batteries_in(campus: Campus, island_id: int) -> list[Battery] {
     return sorted(
         [
-            a as Battery for a in assets_of(base)
+            a as Battery for a in assets_of(campus)
             if isinstance(a, Battery) and a.island_id == island_id and a.alive
         ],
-        key=by_name
+        key=lambda b: Battery : b.name
     );
 }
 
 
-"""Live gensets in one island, in a stable order."""
-def gensets_in(base: Base, island_id: int) -> list[Genset] {
-    return sorted(
-        [
-            a as Genset for a in assets_of(base)
-            if isinstance(a, Genset) and a.island_id == island_id and a.alive
-        ],
-        key=by_name
-    );
-}
+"""Run the generators for this interval and burn the matching fuel.
 
-
-"""Push kWh into the island's batteries, respecting charge-rate limits.
-
-Returns the energy actually absorbed. Anything left over is curtailed --
-on a real site that is the inverter clipping, and it is not a bug.
+Fuel comes out of the day tank first; the day tank tops up from bulk only when
+the supply route is open. Cut the road and the machine runs out in hours.
 """
-def charge_batteries(batts: list[Battery], kwh: float) -> float {
+def run_generators(gens: list[Generator], kwh: float) -> float {
     remaining = kwh;
-    absorbed = 0.0;
-    for b in batts {
+    served = 0.0;
+    for g in gens {
+        g.output_kw = 0.0;
         if remaining <= 0.0 {
-            break;
+            continue;
         }
-        headroom = min(b.capacity_kwh - b.soc_kwh, b.max_charge_kw * DT_H);
-        take = min(headroom, remaining);
+        if resupply_open(g) and g.fuel_liters < g.burn_lph * DT_H * 4.0 {
+            top_up = min(g.bulk_liters, g.burn_lph * DT_H * 8.0);
+            g.fuel_liters += top_up;
+            g.bulk_liters -= top_up;
+        }
+        if g.fuel_liters <= 0.0 {
+            continue;
+        }
+        fuel_limited_kwh = (g.fuel_liters / g.burn_lph) * g.rated_kw;
+        take = min(min(g.rated_kw * DT_H, fuel_limited_kwh), remaining);
         if take > 0.0 {
-            b.soc_kwh += take;
-            absorbed += take;
+            g.output_kw = take / DT_H;
+            g.fuel_liters = max(
+                0.0, g.fuel_liters - g.burn_lph * (g.output_kw / g.rated_kw) * DT_H
+            );
+            served += take;
             remaining -= take;
         }
     }
-    return absorbed;
+    return served;
 }
 
 
-"""Pull kWh out of the island's batteries. Returns what was actually served."""
+"""Pull kWh out of the island's batteries."""
 def discharge_batteries(batts: list[Battery], kwh: float) -> float {
     remaining = kwh;
     served = 0.0;
@@ -94,8 +100,7 @@ def discharge_batteries(batts: list[Battery], kwh: float) -> float {
         if remaining <= 0.0 {
             break;
         }
-        available = min(b.soc_kwh, b.max_discharge_kw * DT_H);
-        take = min(available, remaining);
+        take = min(min(b.soc_kwh, b.max_discharge_kw * DT_H), remaining);
         if take > 0.0 {
             b.soc_kwh -= take;
             served += take;
@@ -106,128 +111,123 @@ def discharge_batteries(batts: list[Battery], kwh: float) -> float {
 }
 
 
-"""Run the gensets for this interval and burn the matching fuel.
-
-Fuel burn is proportional to output, not to runtime: a generator loafing at
-20% does not drink like one at full load.
-"""
-def run_gensets(gens: list[Genset], kwh: float) -> float {
+"""Push kWh into the island's batteries."""
+def charge_batteries(batts: list[Battery], kwh: float) -> float {
     remaining = kwh;
-    served = 0.0;
-    for g in gens {
-        g.output_kw = 0.0;
-        if remaining <= 0.0 or g.fuel_liters <= 0.0 {
-            continue;
+    absorbed = 0.0;
+    for b in batts {
+        if remaining <= 0.0 {
+            break;
         }
-        fuel_limited_kwh = (g.fuel_liters / g.burn_lph) * g.rated_kw;
-        available = min(g.rated_kw * DT_H, fuel_limited_kwh);
-        take = min(available, remaining);
+        take = min(min(b.capacity_kwh - b.soc_kwh, b.max_discharge_kw * DT_H), remaining);
         if take > 0.0 {
-            g.output_kw = take / DT_H;
-            utilisation = g.output_kw / g.rated_kw;
-            g.fuel_liters = max(0.0, g.fuel_liters - g.burn_lph * utilisation * DT_H);
-            served += take;
+            b.soc_kwh += take;
+            absorbed += take;
             remaining -= take;
         }
     }
-    return served;
+    return absorbed;
 }
 
 
-"""Refresh every PV array from the cached hourly curve.
+"""Move one island's physical state forward. Returns unserved kWh."""
+def dispatch_island(campus: Campus, island_id: int) -> float {
+    st = measure_island(campus, island_id);
+    gens = generators_in(campus, island_id);
+    batts = batteries_in(campus, island_id);
+    demand_kwh = st.draw_kw * DT_H;
 
-The curve was fetched once from real NREL PVWatts data and written onto the
-graph. The tick loop reads only from the graph, so a network hiccup -- or a
-dead conference wifi -- can never stall the simulation.
-"""
-def refresh_solar(base: Base) -> None {
-    if len(base.solar_curve) != 24 {
-        return;
-    }
-    idx = int(base.sim_hour) % 24;
-    frac = max(0.0, base.solar_curve[idx] * base.solar_scale);
-    for a in assets_of(base) {
-        if isinstance(a, Solar) {
-            s = a as Solar;
-            s.output_kw = (s.capacity_kw * frac) if s.alive else 0.0;
-        }
-    }
-}
-
-
-"""Move one island's physical state forward by one tick.
-
-Returns the unserved energy in kWh -- non-zero means a genuine brownout,
-which only happens if even tier-1 load exceeds everything we can generate.
-"""
-def dispatch_island(base: Base, island_id: int) -> float {
-    e = measure_island(base, island_id);
-    batts = batteries_in(base, island_id);
-    gens = gensets_in(base, island_id);
-    demand_kwh = e.load_kw * DT_H;
-    solar_kwh = e.solar_now_kw * DT_H;
-
-    if e.grid_tie {
-        # City power is up. It carries the load, and any spare solar plus
-        # cheap grid energy tops the batteries off. When a storm is forecast
-        # SURVEYOR raises storm_prep and we charge hard while we still can.
-        surplus = max(0.0, solar_kwh - demand_kwh);
-        if base.storm_prep {
-            surplus = max(surplus, e.batt_max_kw * DT_H);
-        }
-        _ = charge_batteries(batts, surplus);
+    if st.has_utility {
+        # Commercial power carries the load and tops the batteries off.
+        _ = charge_batteries(batts, st.generation_kw * DT_H);
         for g in gens {
             g.output_kw = 0.0;
         }
         return 0.0;
     }
+    served = run_generators(gens, demand_kwh);
+    served += discharge_batteries(batts, demand_kwh - served);
+    return max(0.0, demand_kwh - served);
+}
 
-    # Islanded. Solar first, then the genset up to its rating, then the
-    # battery for whatever is left. This ordering MUST match
-    # triage.project_endurance -- see the long note there for why the
-    # intuitive "battery before diesel" ordering is wrong.
-    net_kwh = demand_kwh - solar_kwh;
-    if net_kwh <= 0.0 {
-        _ = charge_batteries(batts, -net_kwh);
-        for g in gens {
-            g.output_kw = 0.0;
-        }
-        return 0.0;
-    }
-    served = run_gensets(gens, net_kwh);
-    served += discharge_batteries(batts, net_kwh - served);
-    return max(0.0, net_kwh - served);
+
+"""Find a facility by name, for linking a decision to who it happened to."""
+def facility_named(campus: Campus, name: str) -> list[Facility] {
+    return [
+        a as Facility for a in assets_of(campus)
+        if isinstance(a, Facility) and (a as Facility).name == name
+    ];
 }
 
 
 walker TickWalker {
-    """One 15-minute step: clock -> solar -> brain -> physics."""
+    """One audited step of the world."""
 
-    has unserved_kwh: float = 0.0;
+    # what caused this tick, if anything -- recorded as the Event that
+    # triggered whatever BLUE decides below
+    has cause_kind: str = "";
+    has cause_target: str = "";
+    has cause_detail: str = "";
+    has cause_actor: str = "operator";
+
     has actions: list[str] = [];
-    has reports: list[str] = [];
+    has unserved_kwh: float = 0.0;
 
-    can tick with Base entry {
-        here.sim_hour = (here.sim_hour + DT_H) % 24.0;
-        here.tick_count += 1;
-        refresh_solar(here);
+    can tick with Campus entry {
+        here.tick += 1;
 
-        # Decide first...
-        brain = here spawn RunTriage();
-        self.actions = brain.actions;
-
-        # ...then act. Dispatch moves battery charge and burns fuel.
-        for i in range(here.island_count) {
+        # 1. move the physical state forward from the last dispatch
+        for i in range(max(here.island_count, 0)) {
             self.unserved_kwh += dispatch_island(here, i);
         }
 
-        # ...then measure again. Without this the survival clock on the Base
-        # node is one dispatch step stale -- it would describe the grid as it
-        # was before the batteries moved. Cheap at ~30 nodes, and it means the
-        # number the operator reads is always current. Any extra shedding it
-        # decides is a real decision and is logged like any other.
-        after = here spawn RunTriage();
-        self.actions += after.actions;
-        # No `report` -- it echoes to stdout. Callers read `self.actions`.
+        # 2. island and measure, WITHOUT acting -- this is the evidence
+        pre = refresh_state(here);
+
+        # 3-4. write the snapshot and what caused this tick
+        snap = record_snapshot(here);
+        causes: list[Event] = [];
+        if self.cause_kind {
+            causes.append(record_event(
+                here, snap, self.cause_kind, self.cause_target,
+                self.cause_detail, self.cause_actor
+            ));
+        }
+        # A generator that has run dry is worth recording even though the
+        # islanding walker handles it with no special case.
+        for a in assets_of(here) {
+            if isinstance(a, Generator) {
+                g = a as Generator;
+                if g.alive and g.fuel_liters + g.bulk_liters <= 0.0 {
+                    causes.append(record_event(
+                        here, snap, "fuel_out", g.name,
+                        "day tank and bulk both empty", "physics"
+                    ));
+                }
+            }
+        }
+        cause = causes[0] if causes else None;
+
+        # 5. BLUE decides, and every decision cites the snapshot above
+        for st in pre {
+            for rec in blue_shed(here, st) {
+                subj = facility_named(here, rec.subject);
+                _ = record_decision(
+                    here, snap, cause, rec, subj[0] if subj else None
+                );
+                self.actions.append(
+                    f"{rec.action} tier-{rec.tier} {rec.subject} "
+                    f"({rec.hours_before:.1f}h -> {rec.hours_after:.1f}h)"
+                );
+            }
+        }
+
+        # 6. re-measure so the number on screen is current.
+        # The Snapshot is deliberately NOT updated here. It is the evidence:
+        # the state that caused the decisions above, not the state that
+        # resulted from them. Overwrite it and "why did the cafeteria go dark"
+        # answers with the number BLUE produced instead of the one it reacted
+        # to, which is worse than useless.
+        _ = refresh_state(here);
     }
 }

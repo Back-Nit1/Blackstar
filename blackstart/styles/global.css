@@ -139,3 +139,29 @@ button.ghost { color: var(--dim); }
   margin-top: 26px; padding-top: 13px; border-top: 1px solid var(--line);
   color: #475569; font-size: 11px; text-align: center;
 }
+
+/* ── v2 additions ───────────────────────────────────────── */
+.sub2 { margin: 3px 0 0; color: #64748b; font-size: 11px; }
+.clock .num { font-size: 52px; }
+.stats b.bad { color: var(--bad); }
+
+.lesson {
+  margin: 7px 0 0; font-size: 12px; line-height: 1.6; color: #fcd34d;
+  border-left: 2px solid #78350f; padding-left: 9px;
+}
+
+.eline {
+  border-top: 1px solid var(--line); padding: 8px 0;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.etag {
+  align-self: flex-start; font-size: 9px; letter-spacing: 1.5px;
+  text-transform: uppercase; padding: 1px 7px; border-radius: 3px;
+  background: #1e293b; color: var(--dim);
+}
+.etag.decision { background: #78350f; color: #fcd34d; }
+.etag.event    { background: #7f1d1d; color: #fca5a5; }
+.etag.state    { background: #1e3a8a; color: #bfdbfe; }
+.etag.before   { background: #334155; color: #cbd5e1; }
+.etext { font-size: 12px; line-height: 1.55; }
+.eid { font-size: 10px; color: #475569; font-family: inherit; }

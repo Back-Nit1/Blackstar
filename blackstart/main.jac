@@ -1,15 +1,15 @@
 """BLACKSTART - entry point.
 
-Server modules are imported plainly (server is the default context in a
-`.jac` file); the `cl { }` block below is the browser half of the same
-program. One language, one file tree, one type checker across the wire.
+Server modules are imported plainly (server is the default context in a `.jac`
+file); the `cl { }` block below is the browser half of the same program. One
+language, one file tree, one type checker across the wire.
 
-Run it:   jac start --dev main.jac
+Run it:   jac script web      ->  http://localhost:8000
 """
 
 import from api {
-    Snapshot, NodeView, EdgeView, IncidentView,
-    GetSnapshot, Tick, KillAsset, RestoreAsset, GetIncidents, RunRed, ResetGrid
+    GridView, NodeView, EdgeView, IslandView, EvidenceView, RedRoundView,
+    GetGrid, Tick, CutAsset, RestoreAsset, AskWhy, RunRedRound, ResetGrid
 }
 
 cl {

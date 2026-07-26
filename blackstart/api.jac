@@ -1,26 +1,28 @@
 """BLACKSTART - the API.
 
-There is no Flask, no FastAPI, no route table and no serializer. Every
-`walker:pub` below is automatically a REST endpoint at `/walker/<Name>`, and
-the typed `obj`s cross the wire as hydrated instances the client can dot into.
-That is a whole infrastructure layer that simply does not exist in this repo.
+No Flask, no FastAPI, no route table, no serialiser. Every `walker:pub` here is
+automatically `POST /walker/<Name>`, and the typed objects cross the wire as
+hydrated instances. That is an entire infrastructure layer that does not exist
+in this repo.
 
-The frontend needs exactly six verbs: look at the grid, advance time, kill
-something, restore something, read the incident log, and turn RED loose.
+The screen needs seven verbs: look at the campus, advance time, cut something,
+restore something, ask why, turn RED loose, and reset.
 """
 
 import from grid {
-    GridNode, GridTie, Solar, Battery, Genset, Feeder, Load, Base,
-    Incident, Feeds, PartOf
+    GridNode, UtilityTie, Substation, Feeder, TieSwitch, Generator, Battery,
+    SupplyRoute, Facility, Campus, RedRound, Feeds, PartOf, Logged
 }
-import from triage { RunTriage, IslandEnergy, assets_of, SURVIVAL_TARGET_H, HORIZON_H }
+import from triage {
+    RunTriage, IslandState, assets_of, refresh_state, TARGET_H, HORIZON_H
+}
 import from physics { TickWalker }
 import from ops {
-    asset_label, asset_kind, kill_asset, restore_asset, log_incident,
-    recent_incidents
+    asset_label, asset_kind, kill_asset, restore_asset, is_down, Evidence,
+    WhyWalker
 }
-import from seed { ensure_base, rebuild_twin, find_base }
-import from agents { Surveyor, RedAgent, AttackPlan, chronicle }
+import from seed { ensure_campus, rebuild_campus }
+import from agents { RedAgent }
 
 
 # ── wire types ─────────────────────────────────────────────────────────
@@ -29,6 +31,7 @@ obj NodeView {
     has id: str = "";
     has label: str = "";
     has kind: str = "";
+    has building: str = "";
     has island_id: int = -1;
     has alive: bool = True;
     has shed: bool = False;
@@ -44,161 +47,180 @@ obj EdgeView {
     has live: bool = True;
 }
 
-obj IncidentView {
-    has ts: str = "";
+obj IslandView {
+    has island_id: int = 0;
+    has hours_left: float = 0.0;
+    has draw_kw: float = 0.0;
+    has total_load_kw: float = 0.0;
+    has stored_kwh: float = 0.0;
+    has has_utility: bool = False;
+    has shed_names: list[str] = [];
+}
+
+obj EvidenceView {
+    has node_id: str = "";
+    has tick: int = 0;
     has kind: str = "";
-    has detail: str = "";
-    has report: str = "";
-    has actions: list[str] = [];
-    has recommendation: str = "";
-    has survival_hours: float = 0.0;
+    has line: str = "";
+}
+
+obj RedRoundView {
+    has round: int = 0;
+    has narrative: str = "";
+    has strikes: list[str] = [];
+    has misses: list[str] = [];
+    has lesson: str = "";
+    has try_next: str = "";
+    has dark_tier1: int = 0;
+    has min_hours: float = 0.0;
+    has memory_on: bool = True;
     has authored_by: str = "";
 }
 
-obj Snapshot {
-    has base_name: str = "";
-    has survival_hours: float = 0.0;
-    has target_hours: float = 72.0;
-    has horizon_hours: float = 168.0;
-    has island_count: int = 0;
-    has dark_loads: int = 0;
-    has sim_hour: float = 0.0;
-    has tick_count: int = 0;
-    has weather_headline: str = "";
-    has weather_alert: bool = False;
-    has storm_prep: bool = False;
+obj GridView {
+    has site: str = "";
     has provenance: str = "";
+    has hours_left: float = 0.0;
+    has target_hours: float = 96.0;
+    has horizon_hours: float = 240.0;
+    has islands: int = 0;
+    has dark_facilities: int = 0;
+    has dark_tier1: int = 0;
+    has generation_kw: float = 0.0;
+    has lit_load_kw: float = 0.0;
+    has tick: int = 0;
     has nodes: list[NodeView] = [];
     has edges: list[EdgeView] = [];
-    has islands: list[IslandEnergy] = [];
+    has island_states: list[IslandView] = [];
     has last_actions: list[str] = [];
+    has red_rounds: list[RedRoundView] = [];
 }
 
 
 # ── deterministic layout ───────────────────────────────────────────────
-# Positions are computed here, not stored on the graph: where a dot sits on
-# screen is presentation, not grid state. Same input always gives the same
+# Where a dot sits on screen is presentation, not grid state, so positions are
+# computed here rather than stored. The same campus always draws the same
 # picture, which matters when you demo the same click twice.
 
-glob COL_X: list[float] = [200.0, 500.0, 800.0];
-
-
-"""One line of live detail per asset, for the tooltip under each dot."""
+"""One line of live detail per asset, for the label under each dot."""
 def node_detail(n: GridNode) -> str {
-    if isinstance(n, GridTie) {
-        g = n as GridTie;
-        return f"{g.capacity_kw:.0f} kW tie - {'CLOSED' if g.live else 'OPEN'}";
+    if isinstance(n, UtilityTie) {
+        u = n as UtilityTie;
+        return f"{u.capacity_kw:.0f} kW - {'CLOSED' if u.live else 'OPEN'}";
     }
-    if isinstance(n, Solar) {
-        s = n as Solar;
-        return f"{s.output_kw:.0f} / {s.capacity_kw:.0f} kW";
+    if isinstance(n, Generator) {
+        g = n as Generator;
+        hrs = ((g.fuel_liters + g.bulk_liters) / g.burn_lph) if g.burn_lph > 0.0 else 0.0;
+        return f"{g.rated_kw:.0f} kW - {hrs:.0f} h fuel";
     }
     if isinstance(n, Battery) {
         b = n as Battery;
-        pct = (b.soc_kwh / b.capacity_kwh * 100.0) if b.capacity_kwh > 0.0 else 0.0;
-        return f"{b.soc_kwh:.0f} / {b.capacity_kwh:.0f} kWh  ({pct:.0f}%)";
+        return f"{b.soc_kwh:.0f} / {b.capacity_kwh:.0f} kWh";
     }
-    if isinstance(n, Genset) {
-        gs = n as Genset;
-        hrs = (gs.fuel_liters / gs.burn_lph) if gs.burn_lph > 0.0 else 0.0;
-        return f"{gs.output_kw:.0f} / {gs.rated_kw:.0f} kW - {gs.fuel_liters:.0f} L ({hrs:.0f} h)";
+    if isinstance(n, Facility) {
+        f = n as Facility;
+        return f"tier {f.tier} - {f.demand_kw:.0f} kW";
     }
-    if isinstance(n, Load) {
-        l = n as Load;
-        return f"tier {l.tier} - {l.demand_kw:.0f} kW";
+    if isinstance(n, SupplyRoute) {
+        return "fuel route";
     }
     return "";
 }
 
 
-"""Build the whole picture: nodes with positions, edges, islands, weather."""
-def build_snapshot(base: Base, actions: list[str]) -> Snapshot {
-    brain = base spawn RunTriage();
-    snap = Snapshot(
-        base_name=base.name,
-        survival_hours=base.survival_hours,
-        target_hours=SURVIVAL_TARGET_H,
-        horizon_hours=HORIZON_H as float,
-        island_count=base.island_count,
-        dark_loads=base.dark_loads,
-        sim_hour=base.sim_hour,
-        tick_count=base.tick_count,
-        weather_headline=base.weather_headline,
-        weather_alert=base.weather_alert,
-        storm_prep=base.storm_prep,
-        provenance=base.data_provenance,
-        islands=brain.islands,
-        last_actions=actions
+"""One asset as a drawable dot."""
+def view_of(n: GridNode, x: float, y: float) -> NodeView {
+    alive = n.alive;
+    if isinstance(n, UtilityTie) {
+        alive = (n as UtilityTie).live;
+    }
+    return NodeView(
+        id=jid(n), label=asset_label(n), kind=asset_kind(n),
+        building=(n as Facility).building if isinstance(n, Facility) else "",
+        island_id=n.island_id, alive=alive,
+        shed=(n as Facility).shed if isinstance(n, Facility) else False,
+        tier=(n as Facility).tier if isinstance(n, Facility) else 0,
+        detail=node_detail(n), x=x, y=y
     );
+}
 
-    assets = assets_of(base);
-    feeders = sorted(
-        [a as Feeder for a in assets if isinstance(a, Feeder)],
-        key=lambda f: Feeder : f.feeder_id
-    );
+
+"""Lay the campus out: utility on top, substations, plant, feeders, buildings."""
+def layout(campus: Campus, view: GridView) {
+    assets = assets_of(campus);
     placed: dict[str, bool] = {};
 
-    # the utility layer, across the top
     for a in assets {
-        if isinstance(a, GridTie) {
-            snap.nodes.append(view_of(a, 500.0, 50.0));
+        if isinstance(a, UtilityTie) {
+            view.nodes.append(view_of(a, 500.0, 40.0));
             placed[jid(a)] = True;
         }
     }
-    for a in assets {
-        if isinstance(a, Solar) and jid(a) not in placed {
-            # a PV array with no feeder above it is the utility-side plant
-            parents = [a <-:Feeds:<-];
-            if not parents {
-                snap.nodes.append(view_of(a, 820.0, 50.0));
-                placed[jid(a)] = True;
-            }
-        }
+    subs = sorted(
+        [a for a in assets if isinstance(a, Substation)], key=asset_label
+    );
+    col: dict[str, float] = {};
+    for (i, s) in enumerate(subs) {
+        x = 260.0 + (i as float) * 480.0;
+        col[jid(s)] = x;
+        view.nodes.append(view_of(s, x, 130.0));
+        placed[jid(s)] = True;
+    }
+    for a in sorted([a for a in assets if isinstance(a, TieSwitch)], key=asset_label) {
+        view.nodes.append(view_of(a, 500.0, 130.0));
+        placed[jid(a)] = True;
     }
 
-    # Every feeder gets its column FIRST. Feeders are wired to each other by
-    # the normally-closed bus tie, so if we placed children as we walked, the
-    # tied feeder would be drawn twice -- once under its neighbour and once in
-    # its own column, with a duplicate React key.
-    for (fi, f) in enumerate(feeders) {
-        cx = COL_X[fi] if fi < len(COL_X) else 200.0 + (fi as float) * 300.0;
-        snap.nodes.append(view_of(f, cx, 160.0));
-        placed[jid(f)] = True;
-    }
-
-    for (fi, f) in enumerate(feeders) {
-        cx = COL_X[fi] if fi < len(COL_X) else 200.0 + (fi as float) * 300.0;
-        children = sorted(
-            [c for c in [f ->:Feeds:->] if jid(c) not in placed], key=asset_label
+    # plant and roads sit under the substation that feeds them
+    for (i, s) in enumerate(subs) {
+        kids = sorted(
+            [
+                k for k in [s ->:Feeds:->]
+                if jid(k) not in placed and not isinstance(k, Feeder)
+            ],
+            key=asset_label
         );
-        sources = [c for c in children if not isinstance(c, Load)];
-        loads = [c for c in children if isinstance(c, Load)];
-        for (si, s) in enumerate(sources) {
-            sx = cx - 90.0 + (si as float) * 90.0;
-            snap.nodes.append(view_of(s, sx, 255.0));
-            placed[jid(s)] = True;
+        base_x = col[jid(s)];
+        for (j, k) in enumerate(kids) {
+            view.nodes.append(view_of(k, base_x - 110.0 + (j as float) * 110.0, 225.0));
+            placed[jid(k)] = True;
         }
-        for (li, l) in enumerate(loads) {
-            lx = cx - 60.0 + ((li % 2) as float) * 120.0;
-            ly = 350.0 + (int(li / 2) as float) * 62.0;
-            snap.nodes.append(view_of(l, lx, ly));
-            placed[jid(l)] = True;
+    }
+    for a in sorted([a for a in assets if isinstance(a, SupplyRoute)], key=asset_label) {
+        if jid(a) not in placed {
+            view.nodes.append(view_of(a, 60.0, 225.0 + (len(placed) % 2 as float) * 0.0));
+            placed[jid(a)] = True;
         }
     }
 
-    # anything not placed above still gets a dot -- never silently drop an asset
+    feeders = sorted([a for a in assets if isinstance(a, Feeder)], key=asset_label);
+    for (i, f) in enumerate(feeders) {
+        fx = 190.0 + (i as float) * 310.0;
+        view.nodes.append(view_of(f, fx, 320.0));
+        placed[jid(f)] = True;
+        kids = sorted(
+            [k for k in [f ->:Feeds:->] if jid(k) not in placed], key=asset_label
+        );
+        for (j, k) in enumerate(kids) {
+            kx = fx - 65.0 + ((j % 2) as float) * 130.0;
+            ky = 400.0 + (int(j / 2) as float) * 66.0;
+            view.nodes.append(view_of(k, kx, ky));
+            placed[jid(k)] = True;
+        }
+    }
+    # never silently drop an asset
     spare = 0;
     for a in assets {
         if jid(a) not in placed {
-            snap.nodes.append(view_of(a, 60.0, 50.0 + (spare as float) * 40.0));
+            view.nodes.append(view_of(a, 60.0, 60.0 + (spare as float) * 46.0));
             placed[jid(a)] = True;
             spare += 1;
         }
     }
 
-    # Two typed edge-filtered queries instead of one loop with an if: the
-    # live/cut split is expressed in the query, which is the Jac idiom.
-    known = {n.id: True for n in snap.nodes};
+    # Two typed edge queries instead of one loop with an if: the live/cut split
+    # is expressed in the query, which is the Jac idiom.
+    known = {n.id: True for n in view.nodes};
     for a in assets {
         src = jid(a);
         if src not in known {
@@ -206,182 +228,178 @@ def build_snapshot(base: Base, actions: list[str]) -> Snapshot {
         }
         for d in [a ->:Feeds:live == True:->] {          # jac:ignore[W2075]
             if jid(d) in known {
-                snap.edges.append(EdgeView(src=src, dst=jid(d), live=True));
+                view.edges.append(EdgeView(src=src, dst=jid(d), live=True));
             }
         }
         for d in [a ->:Feeds:live == False:->] {         # jac:ignore[W2075]
             if jid(d) in known {
-                snap.edges.append(EdgeView(src=src, dst=jid(d), live=False));
+                view.edges.append(EdgeView(src=src, dst=jid(d), live=False));
             }
         }
     }
-    return snap;
 }
 
 
-"""One asset as a drawable dot."""
-def view_of(n: GridNode, x: float, y: float) -> NodeView {
-    alive = n.alive;
-    if isinstance(n, GridTie) {
-        alive = (n as GridTie).live;
-    }
-    return NodeView(
-        id=jid(n),
-        label=asset_label(n),
-        kind=asset_kind(n),
-        island_id=n.island_id,
-        alive=alive,
-        shed=(n as Load).shed if isinstance(n, Load) else False,
-        tier=(n as Load).tier if isinstance(n, Load) else 0,
-        detail=node_detail(n),
-        x=x, y=y
+"""RED's memory, newest round first."""
+def red_log(campus: Campus, limit: int) -> list[RedRoundView] {
+    rounds = sorted(
+        [r for r in [campus ->:Logged:->]], key=lambda r: RedRound : -r.round
     );
-}
-
-
-"""The incident log as wire objects, newest first."""
-def incident_views(limit: int) -> list[IncidentView] {
-    out: list[IncidentView] = [];
-    for i in recent_incidents(limit) {
-        out.append(IncidentView(
-            ts=i.ts, kind=i.kind, detail=i.detail, report=i.report,
-            actions=i.actions, recommendation=i.recommendation,
-            survival_hours=i.survival_hours, authored_by=i.authored_by
+    out: list[RedRoundView] = [];
+    for r in rounds[:limit] {
+        out.append(RedRoundView(
+            round=r.round, narrative=r.narrative, strikes=r.strikes,
+            misses=r.misses, lesson=r.lesson, try_next=r.try_next,
+            dark_tier1=r.dark_tier1, min_hours=r.min_hours,
+            memory_on=r.memory_on, authored_by=r.authored_by
         ));
     }
     return out;
 }
 
 
+"""Build the whole picture the screen reads."""
+def build_view(campus: Campus, actions: list[str]) -> GridView {
+    states = refresh_state(campus);
+    view = GridView(
+        site=campus.name, provenance=campus.provenance,
+        hours_left=campus.hours_left, target_hours=campus.target_hours,
+        horizon_hours=HORIZON_H, islands=campus.island_count,
+        dark_facilities=campus.dark_facilities, dark_tier1=campus.dark_tier1,
+        generation_kw=campus.generation_kw, lit_load_kw=campus.lit_load_kw,
+        tick=campus.tick, last_actions=actions,
+        red_rounds=red_log(campus, 6)
+    );
+    for st in states {
+        view.island_states.append(IslandView(
+            island_id=st.island_id, hours_left=st.hours_left,
+            draw_kw=st.draw_kw, total_load_kw=st.total_load_kw,
+            stored_kwh=st.stored_kwh, has_utility=st.has_utility,
+            shed_names=st.shed_names
+        ));
+    }
+    layout(campus, view);
+    return view;
+}
+
+
 # ── the endpoints ──────────────────────────────────────────────────────
 
-walker:pub GetSnapshot {
-    """GET the whole grid. Builds the twin on first call."""
+walker:pub GetGrid {
+    """The whole campus. Builds the twin on first call."""
 
-    has reports: list[Snapshot] = [];
+    has reports: list[GridView] = [];
 
     can run with Root entry {
-        base = ensure_base();
-        _ = base spawn RunTriage();
-        report build_snapshot(base, []);
+        campus = ensure_campus();
+        if campus.tick == 0 {
+            _ = campus spawn TickWalker();
+        }
+        report build_view(campus, []);
     }
 }
 
 
 walker:pub Tick {
-    """Advance the simulation by `steps` x 15 minutes, then re-survey."""
+    """Advance the simulation by `steps` x 15 minutes."""
 
     has steps: int = 1;
-    has reports: list[Snapshot] = [];
+    has reports: list[GridView] = [];
 
     can run with Root entry {
-        base = ensure_base();
+        campus = ensure_campus();
         actions: list[str] = [];
         for _i in range(max(1, min(self.steps, 96))) {
-            t = base spawn TickWalker();
+            t = campus spawn TickWalker();
             actions += t.actions;
         }
-        _ = base spawn Surveyor();
-        report build_snapshot(base, actions);
+        report build_view(campus, actions);
     }
 }
 
 
-walker:pub KillAsset {
-    """Take an asset out of service, re-plan, and have CHRONICLER write it up.
-
-    This is the ONLY kill path. The operator's mouse click, a simulated storm
-    and the RED agent all land here.
-    """
+walker:pub CutAsset {
+    """Cut a cable or take an asset out. THE kill path, shared with RED."""
 
     has label: str = "";
-    has reports: list[Snapshot] = [];
+    has reports: list[GridView] = [];
 
     can run with Root entry {
-        base = ensure_base();
-        ok = kill_asset(base, self.label);
-        if not ok {
-            report build_snapshot(base, [f"unknown asset '{self.label}'"]);
+        campus = ensure_campus();
+        if not kill_asset(campus, self.label) {
+            report build_view(campus, [f"unknown asset '{self.label}'"]);
             disengage;
         }
-        brain = base spawn RunTriage();
-        inc = log_incident(
-            "asset_loss", f"{self.label} lost", base.survival_hours, brain.actions
+        t = campus spawn TickWalker(
+            cause_kind="cut", cause_target=self.label, cause_actor="operator"
         );
-        _ = chronicle(inc, brain.islands, base.survival_hours);
-        _ = base spawn Surveyor();
-        report build_snapshot(base, brain.actions);
+        report build_view(campus, t.actions);
     }
 }
 
 
 walker:pub RestoreAsset {
-    """Put an asset back in service and let the brain restore load."""
+    """Put an asset back and let BLUE re-energise what it can."""
 
     has label: str = "";
-    has reports: list[Snapshot] = [];
+    has reports: list[GridView] = [];
 
     can run with Root entry {
-        base = ensure_base();
-        ok = restore_asset(base, self.label);
-        brain = base spawn RunTriage();
-        if ok {
-            inc = log_incident(
-                "asset_restored", f"{self.label} back in service",
-                base.survival_hours, brain.actions
-            );
-            _ = chronicle(inc, brain.islands, base.survival_hours);
-        }
-        _ = base spawn Surveyor();
-        report build_snapshot(base, brain.actions);
-    }
-}
-
-
-walker:pub GetIncidents {
-    """The incident log with CHRONICLER's reports, newest first."""
-
-    has limit: int = 12;
-    has reports: list[list[IncidentView]] = [];
-
-    can run with Root entry {
-        _ = ensure_base();
-        report incident_views(max(1, min(self.limit, 100)));
-    }
-}
-
-
-walker:pub RunRed {
-    """Turn the attacker loose. It plans, then kills through the normal path."""
-
-    has execute: bool = True;
-    has reports: list[AttackPlan] = [];
-
-    can run with Root entry {
-        base = ensure_base();
-        red = base spawn RedAgent(execute=self.execute);
-        brain = base spawn RunTriage();
-        inc = log_incident(
-            "red_team",
-            f"RED selected {red.plan.target}: {red.plan.reasoning}",
-            base.survival_hours,
-            brain.actions
+        campus = ensure_campus();
+        ok = restore_asset(campus, self.label);
+        t = campus spawn TickWalker(
+            cause_kind=("restore" if ok else ""), cause_target=self.label,
+            cause_actor="operator"
         );
-        inc.authored_by = red.authored_by;
-        _ = chronicle(inc, brain.islands, base.survival_hours);
-        report red.plan;
+        report build_view(campus, t.actions);
+    }
+}
+
+
+walker:pub AskWhy {
+    """Walk the evidence backwards. Every line cites a real graph node."""
+
+    has subject: str = "";
+    has reports: list[list[EvidenceView]] = [];
+
+    can run with Root entry {
+        campus = ensure_campus();
+        why = campus spawn WhyWalker(subject=self.subject);
+        out: list[EvidenceView] = [];
+        for e in why.chain {
+            out.append(EvidenceView(
+                node_id=e.node_id, tick=e.tick, kind=e.kind, line=e.line
+            ));
+        }
+        report out;
+    }
+}
+
+
+walker:pub RunRedRound {
+    """One round of RED: LOOK -> PLAN -> RUN -> REFLECT."""
+
+    has memory_on: bool = True;
+    has reports: list[GridView] = [];
+
+    can run with Root entry {
+        campus = ensure_campus();
+        n = len([r for r in [campus ->:Logged:->]]);
+        red = campus spawn RedAgent(round_no=n + 1, memory_on=self.memory_on);
+        note = red.narrative if not red.failed else red.authored_by;
+        report build_view(campus, ["RED round " + str(n + 1) + ": " + note]);
     }
 }
 
 
 walker:pub ResetGrid {
-    """Tear the twin down and rebuild it. The demo reset button."""
+    """Rebuild the twin, clearing RED's memory and the whole audit chain."""
 
-    has reports: list[Snapshot] = [];
+    has reports: list[GridView] = [];
 
     can run with Root entry {
-        base = rebuild_twin();
-        _ = base spawn RunTriage();
-        report build_snapshot(base, ["grid rebuilt from seed"]);
+        campus = rebuild_campus();
+        _ = campus spawn TickWalker();
+        report build_view(campus, ["campus reset from seed"]);
     }
 }

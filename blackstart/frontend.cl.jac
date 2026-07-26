@@ -1,48 +1,43 @@
 """BLACKSTART - the operator screen.
 
-One page. The grid as dots and lines, a survival clock per island, the live
-weather banner, and click-anything-to-kill. Resist adding dashboards.
+One page: the campus as dots and lines, one big number for hours of power left,
+and click-anything-to-cut.
 
-Every button here spawns the same walker the CLI does. There is no REST
-client, no fetch, no JSON parsing and no hand-written API types -- `root spawn
-KillAsset(label=...)` in the browser is a generated RPC to the walker in
-api.jac, and `Snapshot` arrives as a hydrated typed object.
+Every button spawns the same walker the CLI does. There is no REST client, no
+fetch, no JSON parsing and no hand-written API types -- `root spawn
+CutAsset(label=...)` in the browser is a generated RPC to the walker in api.jac,
+and `GridView` arrives as a hydrated typed object.
 """
 
 sv import from .api {
-    Snapshot, NodeView, EdgeView, IncidentView, AttackPlan,
-    GetSnapshot, Tick, KillAsset, RestoreAsset, GetIncidents, RunRed, ResetGrid
+    GridView, NodeView, EdgeView, IslandView, EvidenceView, RedRoundView,
+    GetGrid, Tick, CutAsset, RestoreAsset, AskWhy, RunRedRound, ResetGrid
 }
-sv import from .triage { IslandEnergy }
 
 import from .components.GridMap { GridMap }
-import from .components.Panels { IslandCard, IncidentFeed }
+import from .components.Panels { IslandCard, RedLog, WhyChain }
 
 
 def:pub app -> JsxElement {
-    has snap: Snapshot | None = None,
-        incidents: list[IncidentView] = [],
+    has grid: GridView | None = None,
+        why: list[EvidenceView] = [],
+        whySubject: str = "",
         selected: str = "",
-        redPlan: AttackPlan = AttackPlan(),
         busy: bool = False,
-        status: str = "connecting to the grid...";
+        memoryOn: bool = True,
+        status: str = "connecting to the campus...";
 
     async can with entry {
-        result = root spawn GetSnapshot();
+        result = root spawn GetGrid();
         if result.reports and len(result.reports) > 0 {
-            snap = result.reports[0];
+            grid = result.reports[0];
             status = "";
-        }
-        log = root spawn GetIncidents(limit=12);
-        if log.reports and len(log.reports) > 0 {
-            incidents = log.reports[0];
         }
     }
 
-    async def reloadIncidents -> None;
     async def doTick -> None;
-    async def doTickFast -> None;
     async def doToggle -> None;
+    async def doWhy -> None;
     async def doRed -> None;
     async def doReset -> None;
 
@@ -50,17 +45,17 @@ def:pub app -> JsxElement {
         selected = "" if selected == label else label;
     }
 
-    # Derived values are plain locals, never `has`.
-    live = snap;
-    if live is None {
-        return <main className="shell">
-            <p className="muted">{status}</p>
-        </main>;
+    def flipMemory(e: MouseEvent) -> None {
+        memoryOn = not memoryOn;
     }
 
-    # Flatten to plain scalars before the JSX. A statement slot re-runs every
-    # render and type narrowing does not survive into it, so we never carry an
-    # optional across that boundary.
+    live = grid;
+    if live is None {
+        return <main className="shell"><p className="muted">{status}</p></main>;
+    }
+
+    # Flatten to scalars before the JSX: narrowing does not survive into a
+    # statement slot, and a slot re-runs every render.
     chosenLabel = "";
     chosenAlive = True;
     for n in live.nodes {
@@ -70,63 +65,68 @@ def:pub app -> JsxElement {
         }
     }
     hasChosen = chosenLabel != "";
-    ok = live.survival_hours >= live.target_hours;
-    big = ">168" if live.survival_hours >= live.horizon_hours
-          else f"{live.survival_hours:.1f}";
+    ok = live.hours_left >= live.target_hours;
+    big = ">240" if live.hours_left >= live.horizon_hours
+          else f"{live.hours_left:.1f}";
 
     return <main className="shell">
         <header className="top">
             <div>
                 <h1>BLACKSTART</h1>
-                <p className="sub">
-                    {live.base_name + "  -  self-healing microgrid control loop"}
+                <p className="sub">{live.site}</p>
+                <p className="sub2">
+                    a hospital (CMS emergency preparedness) and a DoD
+                    installation (10 U.S.C. 2925) - the same building
                 </p>
             </div>
             <div className={"clock ok" if ok else "clock bad"}>
                 <span className="num">{big}</span>
-                <span className="unit">{"h  /  " + f"{live.target_hours:.0f} h target"}</span>
-                <span className="verdict">{"MISSION INTACT" if ok else "AT RISK"}</span>
+                <span className="unit">
+                    {"hours of power left  /  " + f"{live.target_hours:.0f} h target"}
+                </span>
+                <span className="verdict">
+                    {"MEETS TARGET" if ok else "BELOW TARGET"}
+                </span>
             </div>
         </header>
 
-        <div className={"banner alert" if live.weather_alert else "banner"}>
-            <b>{"LIVE NWS ALERT" if live.weather_alert else "WEATHER"}</b>
-            <span>{live.weather_headline}</span>
-            {if live.storm_prep {
-                <span className="prep">STORM PREP: charging batteries</span>
-            }}
-        </div>
-
-        <p className="provenance">
-            {"Grid layout: labelled digital twin from public base specifications. "
-             + "Weather, alerts and the solar curve: real live public data. "
-             + live.provenance}
-        </p>
+        <p className="provenance">{live.provenance}</p>
 
         <section className="stats">
-            <div><span>islands</span><b>{str(live.island_count)}</b></div>
-            <div><span>dark loads</span><b>{str(live.dark_loads)}</b></div>
-            <div><span>sim clock</span><b>{f"{live.sim_hour:04.1f} h"}</b></div>
-            <div><span>tick</span><b>{str(live.tick_count)}</b></div>
+            <div><span>islands</span><b>{str(live.islands)}</b></div>
+            <div><span>dark</span><b>{str(live.dark_facilities)}</b></div>
+            <div><span>tier-1 dark</span>
+                <b className={"bad" if live.dark_tier1 > 0 else ""}>
+                    {str(live.dark_tier1)}
+                </b>
+            </div>
+            <div><span>generation</span><b>{f"{live.generation_kw:.0f} kW"}</b></div>
+            <div><span>energised</span><b>{f"{live.lit_load_kw:.0f} kW"}</b></div>
+            <div><span>tick</span><b>{str(live.tick)}</b></div>
         </section>
 
         <section className="controls">
-            <button onClick={doTick} disabled={busy}>Advance 15 min</button>
-            <button onClick={doTickFast} disabled={busy}>Advance 6 h</button>
-            <button className="danger" onClick={doRed} disabled={busy}>
-                RED: plan and attack
-            </button>
-            <button className="ghost" onClick={doReset} disabled={busy}>
-                Reset grid
-            </button>
             {if hasChosen {
                 <button className="kill" onClick={doToggle} disabled={busy}>
-                    {("Restore " if not chosenAlive else "Kill ") + chosenLabel}
+                    {("Restore " if not chosenAlive else "Cut ") + chosenLabel}
+                </button>
+            }}
+            {if hasChosen {
+                <button onClick={doWhy} disabled={busy}>
+                    {"Ask why: " + chosenLabel}
                 </button>
             }}
             {if not hasChosen {
-                <span className="hint">click any asset on the map to kill it</span>
+                <span className="hint">click any asset on the map to cut it</span>
             }}
+            <button onClick={doTick} disabled={busy}>Advance 15 min</button>
+            <button className="danger" onClick={doRed} disabled={busy}>
+                RED: next round
+            </button>
+            <button className="ghost" onClick={flipMemory} disabled={busy}>
+                {"RED memory: " + ("ON" if memoryOn else "OFF")}
+            </button>
+            <button className="ghost" onClick={doReset} disabled={busy}>Reset</button>
         </section>
 
         {if len(live.last_actions) > 0 {
@@ -137,36 +137,24 @@ def:pub app -> JsxElement {
             </section>
         }}
 
-        {if redPlan.target != "" {
-            <section className="redbox">
-                <h3>{"RED selected: " + redPlan.target}</h3>
-                <p>{redPlan.reasoning}</p>
-                {if redPlan.runner_up != "" {
-                    <p className="muted">{"runner-up: " + redPlan.runner_up}</p>
-                }}
-                {if redPlan.mitigation != "" {
-                    <p className="rec">{"MITIGATION: " + redPlan.mitigation}</p>
-                }}
-            </section>
-        }}
-
         <section className="body">
             <div className="mapwrap">
                 <GridMap nodes={live.nodes} edges={live.edges}
                          selected={selected} onSelect={pick}/>
             </div>
             <aside className="side">
-                {for e in live.islands {
-                    <IslandCard key={"isl" + str(e.island_id)} island={e}
+                {for isl in live.island_states {
+                    <IslandCard key={"i" + str(isl.island_id)} island={isl}
                                 targetHours={live.target_hours}
                                 horizon={live.horizon_hours}/>
                 }}
-                <IncidentFeed incidents={incidents}/>
+                <WhyChain subject={whySubject} chain={why}/>
+                <RedLog rounds={live.red_rounds}/>
             </aside>
         </section>
 
         <footer className="foot">
-            DEMO - digital twin. Not connected to any real electrical
+            DEMO - labelled digital twin. Not connected to any real electrical
             infrastructure. Built in Jac for JacHacks SF.
         </footer>
     </main>;
